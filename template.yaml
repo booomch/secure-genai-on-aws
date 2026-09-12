@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Layered prompt-injection defense demo for Amazon Bedrock
+
+Parameters:
+  GuardrailId:
+    Type: String
+    Description: ID of an existing Amazon Bedrock Guardrail
+  GuardrailVersion:
+    Type: String
+    Default: DRAFT
+  ModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+
+Resources:
+  SecureApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      EndpointConfiguration:
+        Type: REGIONAL
+
+  PromptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      CodeUri: .
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          GUARDRAIL_ID:
+            Ref: GuardrailId
+          GUARDRAIL_VERSION:
+            Ref: GuardrailVersion
+          MODEL_ID:
+            Ref: ModelId
+      Policies:
+        - Statement:
+            - Sid: InvokeOnlySelectedModel
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}
+      Events:
+        Prompt:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: SecureApi
+            Path: /prompt
+            Method: post
+
+  UnsafePromptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.unsafe_handler
+      CodeUri: .
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          MODEL_ID:
+            Ref: ModelId
+      Policies:
+        - Statement:
+            - Sid: InvokeOnlySelectedModel
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}
+      Events:
+        Prompt:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: SecureApi
+            Path: /unsafe
+            Method: post
+
+  ApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: prompt-injection-demo
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSCommonRules
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: common-rules
+            SampledRequestsEnabled: true
+        - Name: PerIpRateLimit
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: IP
+              Limit: 100
+              EvaluationWindowSec: 60
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit
+            SampledRequestsEnabled: true
+
+  ApiWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: SecureApiProdStage
+    Properties:
+      ResourceArn:
+        Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${SecureApi}/stages/Prod
+      WebACLArn:
+        Fn::GetAtt: [ApiWebAcl, Arn]
+
+Outputs:
+  UnsafePromptUrl:
+    Value:
+      Fn::Sub: https://${SecureApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/unsafe
+  PromptUrl:
+    Value:
+      Fn::Sub: https://${SecureApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/prompt
